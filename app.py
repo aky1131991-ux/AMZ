@@ -35,6 +35,7 @@ PROFILE_DIR = APP_DIR / "browser-profile"
 TELEGRAM_PROFILE_DIR = APP_DIR / "telegram-browser-profile"
 AMAZON_URL = "https://www.jobsatamazon.co.uk/app#/myApplications"
 TELEGRAM_URL = "https://web.telegram.org/a/#-1003679177308"
+APP_VERSION = "1.2.0"
 
 
 def now_iso() -> str:
@@ -168,11 +169,11 @@ class AmazonAdapter:
         self.store = store
         self.notify = notify
         self.requests: queue.Queue[tuple[Callable[[], Any], Future[Any]]] = queue.Queue()
-        self.worker = threading.Thread(target=self._worker_loop, name="amazon-playwright", daemon=True)
-        self.worker.start()
         self.playwright = None
         self.browser = None
         self.page = None
+        self.worker = threading.Thread(target=self._worker_loop, name="amazon-playwright", daemon=True)
+        self.worker.start()
 
     def _worker_loop(self) -> None:
         while True:
@@ -188,6 +189,8 @@ class AmazonAdapter:
                 result.set_exception(exc)
 
     def _call(self, operation: Callable[[], Any]) -> Any:
+        if not self.worker.is_alive():
+            raise RuntimeError("Amazon browser worker stopped; restart the app.")
         result: Future[Any] = Future()
         self.requests.put((operation, result))
         return result.result()
@@ -380,7 +383,7 @@ class App:
         ttk.Label(outer, text="ACTIVITY", font=("DejaVu Sans", 10, "bold")).pack(anchor="w", pady=(24, 8))
         self.log = tk.Text(outer, height=12, state="disabled", bg="#18272b", fg="#d6e2dc", relief="flat", padx=14, pady=12, font=("DejaVu Sans Mono", 9))
         self.log.pack(fill="both", expand=True)
-        self.write_log("Ready. Authentication uses your existing browser profile.")
+        self.write_log(f"Ready. Version {APP_VERSION}. Authentication uses your existing browser profile.")
 
     def write_log(self, message: str) -> None:
         self.store.record_event(message)
