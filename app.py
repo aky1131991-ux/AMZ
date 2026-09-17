@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import sqlite3
 import subprocess
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -165,9 +167,30 @@ class AmazonAdapter:
     def __init__(self, store: ShiftStore, notify: Callable[[str, str], None]) -> None:
         self.store = store
         self.notify = notify
+        self.requests: queue.Queue[tuple[Callable[[], Any], Future[Any]]] = queue.Queue()
+        self.worker = threading.Thread(target=self._worker_loop, name="amazon-playwright", daemon=True)
+        self.worker.start()
         self.playwright = None
         self.browser = None
         self.page = None
+
+    def _worker_loop(self) -> None:
+        while True:
+            operation, result = self.requests.get()
+            try:
+                result.set_result(operation())
+            except Exception as exc:
+                if self.page:
+                    try:
+                        self.page.screenshot(path=str(APP_DIR / f"amazon-error-{int(time.time())}.png"), full_page=True)
+                    except Exception:
+                        pass
+                result.set_exception(exc)
+
+    def _call(self, operation: Callable[[], Any]) -> Any:
+        result: Future[Any] = Future()
+        self.requests.put((operation, result))
+        return result.result()
 
     def _require_playwright(self) -> None:
         if self.playwright is None:
@@ -180,23 +203,23 @@ class AmazonAdapter:
             except Exception as exc:
                 raise RuntimeError("Playwright is unavailable. Install dependencies and browsers first.") from exc
 
-    def open(self) -> None:
+    def _open(self) -> None:
         self._require_playwright()
         self.page.goto(AMAZON_URL, wait_until="domcontentloaded", timeout=30_000)
 
     def _verification_required(self) -> bool:
-        body = self.page.locator("body").inner_text(timeout=5).lower()
+        body = self.page.locator("body").inner_text(timeout=5_000).lower()
         return any(term in body for term in ("captcha", "two-factor", "2fa", "verification code", "security check"))
 
-    def test_login(self) -> bool:
-        self.open()
+    def _test_login(self) -> bool:
+        self._open()
         if self._verification_required():
             self.notify("Amazon requires manual CAPTCHA/2FA verification.", "verification")
             return False
-        return "my applications" in self.page.locator("body").inner_text(timeout=5).lower()
+        return "my applications" in self.page.locator("body").inner_text(timeout=5_000).lower()
 
-    def visible_shifts(self) -> list[dict[str, Any]]:
-        self.open()
+    def _visible_shifts(self) -> list[dict[str, Any]]:
+        self._open()
         if self._verification_required():
             self.notify("Amazon requires manual CAPTCHA/2FA verification.", "verification")
             return []
@@ -204,7 +227,7 @@ class AmazonAdapter:
         results = []
         for index in range(buttons.count()):
             button = buttons.nth(index)
-            card_text = button.locator("xpath=ancestor::*[self::li or @role='article' or contains(@class, 'card')][1]").inner_text(timeout=3)
+            card_text = button.locator("xpath=ancestor::*[self::li or @role='article' or contains(@class, 'card')][1]").inner_text(timeout=3_000)
             parsed = parse_shift(card_text)
             if parsed:
                 parsed["amazon_id"] = str(index)
@@ -212,7 +235,7 @@ class AmazonAdapter:
                 results.append(parsed)
         return results
 
-    def select_and_open_confirmation(self, shift: dict[str, Any]) -> bool:
+    def _select_and_open_confirmation(self, shift: dict[str, Any]) -> bool:
         if self._verification_required():
             self.notify("Amazon requires manual CAPTCHA/2FA verification.", "verification")
             return False
@@ -222,13 +245,25 @@ class AmazonAdapter:
         self.page.wait_for_load_state("domcontentloaded", timeout=15_000)
         return not self._verification_required()
 
-    def submit_after_confirmation(self) -> None:
+    def _submit_after_confirmation(self) -> None:
         if self._verification_required():
             raise RuntimeError("Amazon verification is required; submission stopped.")
         submit = self.page.get_by_role("button", name=re.compile(r"submit|apply", re.I)).last
         if submit.count() != 1:
             raise RuntimeError("Could not identify exactly one final submit button; submission stopped.")
         submit.click()
+
+    def test_login(self) -> bool:
+        return self._call(self._test_login)
+
+    def visible_shifts(self) -> list[dict[str, Any]]:
+        return self._call(self._visible_shifts)
+
+    def select_and_open_confirmation(self, shift: dict[str, Any]) -> bool:
+        return self._call(lambda: self._select_and_open_confirmation(shift))
+
+    def submit_after_confirmation(self) -> None:
+        self._call(self._submit_after_confirmation)
 
 
 class TelegramAdapter:
@@ -256,7 +291,12 @@ class TelegramAdapter:
             page = self.context.pages[0] if self.context.pages else self.context.new_page()
             page.goto(TELEGRAM_URL, wait_until="domcontentloaded", timeout=30_000)
             while not self.stop_event.is_set():
-                body = page.locator("body").inner_text(timeout=10)
+                try:
+                    body = page.locator("body").inner_text(timeout=10_000)
+                except Exception as exc:
+                    self.notify(f"Telegram Web is not ready: {exc}", "error")
+                    self.stop_event.wait(self.settings.polling_seconds)
+                    continue
                 lowered = body.lower()
                 if any(term in lowered for term in ("log in", "qr code", "verification code")):
                     self.notify("Telegram Web needs manual login or verification.", "verification")
@@ -280,7 +320,7 @@ class TelegramAdapter:
         for index in range(min(messages.count(), 100)):
             item = messages.nth(index)
             try:
-                text = item.inner_text(timeout=1).strip()
+                text = item.inner_text(timeout=1_000).strip()
             except Exception:
                 continue
             if not text:
@@ -398,11 +438,6 @@ class App:
                 self.notify(f"MATCH FOUND: {shift['location']} / {shift['hours']}h / {shift.get('shift_type') or 'shift'}", "match")
                 self.root.after(0, lambda item=shift: self.offer_shift(item))
         except Exception as exc:
-            try:
-                if self.amazon.page:
-                    self.amazon.page.screenshot(path=str(APP_DIR / f"amazon-error-{int(time.time())}.png"), full_page=True)
-            except Exception:
-                pass
             self.root.after(0, lambda: self.amazon_var.set("Disconnected")); self.notify(f"Amazon check stopped: {exc}", "error")
         if self.running: self.root.after(self.settings.polling_seconds * 1000, self.check_now)
 
